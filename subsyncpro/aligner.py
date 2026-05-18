@@ -89,6 +89,47 @@ def _filter_dialogue_only(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     return [e for e in events if not _is_sdh_event(e.text)]
 
 
+# ── boundary time exclusion ───────────────────────────────────────────────────
+
+# Translator/sync credits live in the first ~60 s of a translated subtitle.
+# Cast and crew credits roll in the last ~90 s of a movie.  Neither has a
+# counterpart in the original-language reference, so they generate spurious
+# anchors that bias the offset estimate.
+#
+# Time-based exclusion is symmetric (same wall-clock window for both files),
+# density-independent (works for sparse and dense subtitles alike), and
+# never accidentally discards real dialogue — translator credits are always
+# well within the first 90 s.
+_SKIP_HEAD_MS: int = 90_000    # ignore first 90 s of each subtitle's span
+_SKIP_TAIL_MS: int = 120_000   # ignore last 2 min of each subtitle's span
+
+
+def _skip_boundary_time(
+    events: list[SubtitleEvent],
+    head_ms: int = _SKIP_HEAD_MS,
+    tail_ms: int = _SKIP_TAIL_MS,
+) -> list[SubtitleEvent]:
+    """Return only events that fall outside the head/tail boundary windows.
+
+    Events whose *start* is within the first *head_ms* or the last *tail_ms*
+    of the subtitle's own time span are excluded from fingerprinting.  The
+    full event list is still passed to the writer — the exclusion is only for
+    alignment voting.
+
+    If the subtitle is shorter than head + tail + 60 s the full list is
+    returned unchanged so short content is not over-excluded.
+    """
+    if not events:
+        return events
+    t_first = events[0].start_ms
+    t_last = events[-1].start_ms
+    if t_last - t_first < head_ms + tail_ms + 60_000:
+        return events
+    lo = t_first + head_ms
+    hi = t_last - tail_ms
+    return [e for e in events if lo <= e.start_ms <= hi]
+
+
 # ── result type ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -509,15 +550,32 @@ def align(
     max_offset_ms = max_offset_s * 1000
 
     # ── 1. Build fingerprints ────────────────────────────────────────────
-    ref_dur = fingerprint_duration_ms(ref_events)
-    uns_dur = fingerprint_duration_ms(unsync_events)
+    # Exclude the first 90 s and last 2 min of each subtitle from fingerprinting.
+    # Translator/sync credits live in the first ~60 s of a translated subtitle;
+    # cast/crew credits roll in the last ~90 s of a movie.  Neither has a
+    # counterpart in the reference, so they bias the offset estimate.
+    # Time-based exclusion is symmetric and density-independent.
+    # The full event lists are still used by the writer — exclusion is alignment-only.
+    ref_fp_events = _skip_boundary_time(ref_events)
+    uns_fp_events = _skip_boundary_time(unsync_events)
+    if verbose and (len(ref_fp_events) != len(ref_events)
+                    or len(uns_fp_events) != len(unsync_events)):
+        log.info(
+            "Boundary skip: ref %d→%d events, unsync %d→%d events "
+            "(first 90 s and last 2 min excluded from alignment voting)",
+            len(ref_events), len(ref_fp_events),
+            len(unsync_events), len(uns_fp_events),
+        )
+
+    ref_dur = fingerprint_duration_ms(ref_fp_events)
+    uns_dur = fingerprint_duration_ms(uns_fp_events)
     # ref is padded to cover the full search range; unsync keeps its natural size.
     # We add max_offset_ms to ref's right so that windows at the end of unsync
     # can still find a match even if ref ends earlier.
     ref_padded_dur = ref_dur + int(max_offset_ms) + 60_000
 
-    ref_fp = make_fingerprint(ref_events, ref_padded_dur, resolution_ms)
-    uns_fp = make_fingerprint(unsync_events, uns_dur, resolution_ms)
+    ref_fp = make_fingerprint(ref_fp_events, ref_padded_dur, resolution_ms)
+    uns_fp = make_fingerprint(uns_fp_events, uns_dur, resolution_ms)
 
     if verbose:
         log.info(
@@ -616,13 +674,13 @@ def align(
         # contain 5-7 second sound-effect blocks that have no counterpart in a
         # translated subtitle; leaving them in creates 10× stronger false peaks
         # at wrong offsets that swamp the true dialogue-based correlation signal.
-        ref_dial = _filter_dialogue_only(ref_events)
-        uns_dial = _filter_dialogue_only(unsync_events)
+        ref_dial = _filter_dialogue_only(ref_fp_events)
+        uns_dial = _filter_dialogue_only(uns_fp_events)
         ref_fp_bin = make_binary_fingerprint(
-            ref_dial if ref_dial else ref_events, ref_padded_dur, resolution_ms
+            ref_dial if ref_dial else ref_fp_events, ref_padded_dur, resolution_ms
         )
         uns_fp_bin = make_binary_fingerprint(
-            uns_dial if uns_dial else unsync_events, uns_dur, resolution_ms
+            uns_dial if uns_dial else uns_fp_events, uns_dur, resolution_ms
         )
 
         # Pass 1: full-range search — finds the right neighbourhood for each segment.
@@ -637,6 +695,7 @@ def align(
 
         if len(seg_offsets) >= 2:
             seg_scale, seg_off_ms, seg_conf, seg_n_in = _fit_segment_offsets(seg_offsets)
+            seg_n_total = len(seg_offsets)
 
             if verbose:
                 log.info(
@@ -644,13 +703,40 @@ def align(
                     seg_scale, seg_off_ms / 1000, seg_conf * 100,
                 )
 
-            # Pass 2: narrow search (±3 s) around each segment's predicted position.
+            # Dynamic search radius for pass 2.
+            #
+            # When pass 1 captures some false-peak segments (e.g. sparse early
+            # content in a movie) the fitted intercept can be off by several
+            # seconds even though the scale is correct.  If we fix the radius at
+            # 3 s, pass 2's search window for those segments will miss the true
+            # peak entirely — perpetuating the error.
+            #
+            # We measure how far each pass-1 segment deviates from the fitted
+            # line (residual).  The 90th-percentile residual tells us the worst
+            # reliable deviation without being dominated by a single outlier.
+            # The pass-2 radius is then set to cover that spread plus 2 s margin,
+            # clamped between 3 s (normal case) and 20 s (very uncertain pass 1).
+            _slope_p1 = seg_scale - 1.0
+            _p1_residuals = [
+                abs(o - (_slope_p1 * t + seg_off_ms))
+                for t, o, _ in seg_offsets
+            ]
+            _p90_residual = float(np.percentile(_p1_residuals, 90)) if _p1_residuals else 3_000.0
+            refine_radius_p2 = max(3_000, min(20_000, int(_p90_residual * 1.5) + 2_000))
+
+            if verbose:
+                log.info(
+                    "Pass 2 search radius: %.1f s (p90 residual=%.1f s)",
+                    refine_radius_p2 / 1000, _p90_residual / 1000,
+                )
+
+            # Pass 2: narrow search around each segment's predicted position.
             # This eliminates ambiguity from weak false peaks that pulled the
             # full-range estimate away from truth.
             seg_offsets2 = _segmented_binary_alignment(
                 ref_fp_bin, uns_fp_bin, resolution_ms, max_offset_ms,
                 seed_scale=seg_scale, seed_offset_ms=seg_off_ms,
-                refine_radius_ms=3_000,
+                refine_radius_ms=float(refine_radius_p2),
             )
             if len(seg_offsets2) >= 2:
                 seg_scale2, seg_off_ms2, seg_conf2, seg_n_in2 = _fit_segment_offsets(seg_offsets2)
@@ -664,6 +750,7 @@ def align(
                 # Accept pass-2 result only if it's at least as good
                 if seg_conf2 >= seg_conf:
                     seg_scale, seg_off_ms, seg_conf, seg_n_in = seg_scale2, seg_off_ms2, seg_conf2, seg_n_in2
+                    seg_n_total = len(seg_offsets2)
 
             if seg_conf > conf or len(inliers) < _MIN_INLIERS:
                 seg_mode = "linear" if abs(seg_scale - 1.0) > 1e-4 else "offset"
@@ -671,7 +758,7 @@ def align(
                     offset_ms=float(seg_off_ms),
                     scale=float(seg_scale),
                     confidence=float(seg_conf),
-                    n_anchors=len(seg_offsets),
+                    n_anchors=seg_n_total,
                     n_inliers=seg_n_in,
                     coarse_offset_ms=coarse_ms,
                     mode_used=seg_mode,
