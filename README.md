@@ -74,8 +74,18 @@ All three tests were confirmed correct by manual verification at multiple timest
 ### Requirements
 
 - **Python 3.9+**
-- **FFmpeg** — only needed when using a video file (MKV/MP4/…) as the reference.  
-  Not required for subtitle-to-subtitle alignment.
+- **FFmpeg** — needed when using a video file (MKV/MP4/…) as the reference. Not required for subtitle-to-subtitle alignment.
+- **MKVToolNix** *(optional but recommended)* — provides `mkvextract`, which is used in preference to ffmpeg for extracting subtitle tracks from MKV files. It is purpose-built for MKV demuxing: no transcoding pipeline, no full file decode — just direct track extraction. Significantly faster and lighter, especially on slow HDD servers with large files. SubSyncPro falls back to ffmpeg automatically if MKVToolNix is not installed.
+
+### Install MKVToolNix (recommended for MKV sources)
+
+| Platform | Command |
+|---|---|
+| Windows | `winget install MKVToolNix.MKVToolNix` |
+| macOS | `brew install mkvtoolnix` |
+| Linux | `sudo apt install mkvtoolnix` (or your distro's package manager) |
+
+Or download from [mkvtoolnix.download](https://mkvtoolnix.download/).
 
 ### Install FFmpeg
 
@@ -173,6 +183,8 @@ subsyncpro REF UNSYNC [options]
 | `--list-tracks` | List all subtitle tracks embedded in the video file and exit without syncing. Useful before choosing a specific track. |
 | `--ref-track IDX` | Force the use of a specific track by its stream index (as shown by `--list-tracks`). |
 | `--ref-lang LANG` | Preferred language when auto-selecting a track from a video file (e.g. `eng`, `jpn`, `fra`). Default: English. |
+| `--ffprobe-timeout SEC` | `120` | Seconds to wait for ffprobe when probing the video file. Increase on slow HDD servers with large files. |
+| `--ffmpeg-timeout SEC` | `300` | Seconds to wait for ffmpeg (or mkvextract) when extracting a subtitle track. Increase on slow HDD servers. |
 
 ---
 

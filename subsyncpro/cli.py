@@ -579,7 +579,7 @@ def _load_ref_raw(args: argparse.Namespace):
         unsync_is_sdh = _is_sdh_subtitle(Path(args.unsync))
         tmp_dir = Path(tempfile.mkdtemp(prefix="subsyncpro_ref_"))
         try:
-            extracted, track = extract_best_subtitle(
+            extracted, track, tool_used = extract_best_subtitle(
                 ref_path,
                 preferred_lang=args.ref_lang,
                 preferred_index=args.ref_track,
@@ -596,9 +596,11 @@ def _load_ref_raw(args: argparse.Namespace):
             f"  MKV track {track.index}: [cyan]{track.codec}[/cyan] "
             f"lang=[cyan]{track.language}[/cyan]{sdh_note}"
             + (f" title='{track.title}'" if track.title else "")
+            + f" [dim](via {tool_used})[/dim]"
             if _HAS_RICH else
             f"  MKV track {track.index}: {track.codec} lang={track.language}{sdh_note}"
-            + (f" title='{track.title}'" if track.title else ""),
+            + (f" title='{track.title}'" if track.title else "")
+            + f" (via {tool_used})",
             style="dim",
         )
         ref_path = extracted

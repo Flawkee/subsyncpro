@@ -185,26 +185,73 @@ def select_best_track(
 
 # ── extraction ────────────────────────────────────────────────────────────────
 
+_log = __import__("logging").getLogger(__name__)
+
+
+def _try_mkvextract(
+    mkv_path: Path,
+    track_index: int,
+    output_path: Path,
+    timeout: int,
+) -> bool:
+    """Attempt extraction with mkvextract.  Returns True on success.
+
+    mkvextract (MKVToolNix) is purpose-built for MKV demuxing: it reads the
+    track directly from the container index without any transcoding pipeline,
+    making it 5-10× faster and far less memory-hungry than ffmpeg for this
+    task.  mkvextract track IDs match ffprobe stream indices for standard MKV
+    files, so we can pass the same index.
+    """
+    mkvextract = shutil.which("mkvextract")
+    if mkvextract is None:
+        return False
+
+    cmd = [mkvextract, "tracks", str(mkv_path), f"{track_index}:{output_path}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _log.warning("mkvextract timed out after %d s — falling back to ffmpeg", timeout)
+        return False
+
+    if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        _log.debug("mkvextract failed (rc=%d) — falling back to ffmpeg", result.returncode)
+        return False
+
+    _log.info("Extracted track %d using mkvextract", track_index)
+    return True
+
+
 def extract_subtitle_track(
     mkv_path: str | Path,
     track_index: int,
     output_path: str | Path,
     timeout: int = 300,
-) -> Path:
-    """Extract a specific subtitle track to *output_path* using ffmpeg.
+) -> tuple[Path, str]:
+    """Extract a specific subtitle track to *output_path*.
 
-    *timeout* (seconds) controls how long each ffmpeg call is allowed to run.
-    300 s (5 min) is the default to handle large files on slow HDD servers;
-    raise it with ``--ffmpeg-timeout`` if extraction still times out.
+    Tries mkvextract (MKVToolNix) first — it is faster and lighter than
+    ffmpeg for MKV demuxing because it bypasses the full media pipeline.
+    Falls back to ffmpeg automatically if mkvextract is not installed or
+    the extraction fails for any reason.
+
+    Returns ``(output_path, tool_used)`` where *tool_used* is ``"mkvextract"``
+    or ``"ffmpeg"``.  *timeout* (seconds) applies to each tool individually.
     """
-    ffmpeg = _require_binary("ffmpeg")
     out = Path(output_path)
+
+    # ── prefer mkvextract (fast, lightweight) ─────────────────────────────
+    if _try_mkvextract(Path(mkv_path), track_index, out, timeout):
+        return out, "mkvextract"
+
+    # ── ffmpeg fallback ────────────────────────────────────────────────────
+    _log.info("Extracting track %d using ffmpeg", track_index)
+    ffmpeg = _require_binary("ffmpeg")
     cmd = [
         ffmpeg, "-v", "warning",
         "-i", str(mkv_path),
         "-map", f"0:{track_index}",
         "-c:s", "copy",
-        "-y",           # overwrite
+        "-y",
         str(out),
     ]
     try:
@@ -216,7 +263,7 @@ def extract_subtitle_track(
         )
 
     if result.returncode != 0:
-        # Some codecs need explicit conversion
+        # Some codecs need transcoding rather than stream-copy
         cmd2 = [
             ffmpeg, "-v", "warning",
             "-i", str(mkv_path),
@@ -235,7 +282,7 @@ def extract_subtitle_track(
             f"ffmpeg produced an empty file for track {track_index}. "
             "The track may be image-based (PGS/DVDSUB) and cannot be used as reference."
         )
-    return out
+    return out, "ffmpeg"
 
 
 def extract_best_subtitle(
@@ -246,10 +293,11 @@ def extract_best_subtitle(
     prefer_sdh: bool = False,
     ffprobe_timeout: int = 120,
     ffmpeg_timeout: int = 300,
-) -> tuple[Path, SubtitleTrack]:
+) -> tuple[Path, SubtitleTrack, str]:
     """Find and extract the best subtitle track from an MKV.
 
-    Returns (extracted_path, track_info).
+    Returns ``(extracted_path, track_info, tool_used)`` where *tool_used* is
+    ``"mkvextract"`` or ``"ffmpeg"``.
     Caller is responsible for cleaning up the file if *output_dir* is a temp dir.
     """
     mkv = Path(mkv_path)
@@ -278,8 +326,8 @@ def extract_best_subtitle(
     ext = ext_map.get(track.format_hint, ".srt")
     out_path = Path(output_dir) / f"ref_track{track.index}{ext}"
 
-    extracted = extract_subtitle_track(mkv, track.index, out_path, timeout=ffmpeg_timeout)
-    return extracted, track
+    extracted, tool_used = extract_subtitle_track(mkv, track.index, out_path, timeout=ffmpeg_timeout)
+    return extracted, track, tool_used
 
 
 # ── human-readable track table ────────────────────────────────────────────────
