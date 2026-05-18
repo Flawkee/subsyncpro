@@ -20,19 +20,38 @@ def _transform_ms(t: int, scale: float, offset_ms: float) -> int:
     return max(0, round(scale * t + offset_ms))
 
 
+def _segment_for(t: float, segments) -> tuple[float, float]:
+    """Return (scale, offset_ms) for the piecewise segment covering *t*.
+
+    Segments are domain-disjoint with start_ms inclusive and end_ms exclusive;
+    the first segment owns -inf and the last owns +inf, so a covering segment
+    always exists.
+    """
+    for seg in segments:
+        if seg.start_ms <= t < seg.end_ms:
+            return seg.scale, seg.offset_ms
+    return segments[-1].scale, segments[-1].offset_ms
+
+
 def apply_transform(
     events: list[SubtitleEvent],
     result: AlignResult,
 ) -> list[SubtitleEvent]:
     """Return a new list of SubtitleEvents with timestamps adjusted.
 
-    The original list is not modified.
+    The original list is not modified.  When *result.segments* is set, each
+    event is transformed by the piecewise segment that owns its start time
+    (the end time uses the same segment so single events are never split
+    across two models, which would distort their duration).
     """
-    scale = result.scale
-    offset_ms = result.offset_ms
     synced: list[SubtitleEvent] = []
+    has_pieces = bool(result.segments and len(result.segments) > 1)
     for ev in events:
         new_ev = deepcopy(ev)
+        if has_pieces:
+            scale, offset_ms = _segment_for(float(ev.start_ms), result.segments)
+        else:
+            scale, offset_ms = result.scale, result.offset_ms
         new_ev.start_ms = _transform_ms(ev.start_ms, scale, offset_ms)
         new_ev.end_ms = _transform_ms(ev.end_ms, scale, offset_ms)
         # Guarantee minimum 1 ms duration

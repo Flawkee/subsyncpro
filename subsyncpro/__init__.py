@@ -15,6 +15,7 @@ def align_subtitles(
     ref_track: int | None = None,
     encoding: str | None = None,
     verbose: bool = False,
+    lead_bias_ms: float = 0.0,
 ) -> dict:
     """Programmatic entry point — synchronize *unsync_path* using *ref_path*.
 
@@ -34,4 +35,5 @@ def align_subtitles(
         verbose=verbose,
         dry_run=False,
         output_format="auto",
+        lead_bias_ms=lead_bias_ms,
     )

@@ -167,6 +167,7 @@ subsyncpro REF UNSYNC [options]
 | `-m MODE`, `--mode {auto,offset,linear}` | `auto` | Alignment mode (see below) |
 | `--max-offset SECONDS` | `600` | Maximum expected timing difference in seconds. Raise to `1800` or more if the reference covers multiple episodes or has very long recap segments. |
 | `--offset-hint MS` | — | Rough offset hint in milliseconds. Optional speed-up when you already know the approximate delay from a previous run. |
+| `--lead-bias-ms MS` | `0` | Constant bias (ms) added to every timestamp *after* alignment. Use a positive value to push subtitles later (e.g. `--lead-bias-ms 200` to remove a translator's 200 ms reading-time lead). |
 
 **Alignment modes:**
 
@@ -289,6 +290,9 @@ PGS (Blu-ray) and DVDSUB (DVD) subtitle tracks are bitmap images that cannot be 
 
 **Subtitles drift over a long episode**  
 Use `--mode linear`. This corrects frame-rate mismatches between different source encodings (e.g. a subtitle timed for a 25 fps PAL broadcast vs a 23.976 fps NTSC stream).
+
+**Subtitles are consistently 100–500 ms early after syncing**  
+This is usually *translator lead time*, not an alignment error. Many translated subtitles are deliberately timed to appear 100–500 ms before the spoken audio so viewers have time to read the line. SubSyncPro aligns to the original timestamps in your reference, which preserves the translator's intent. If you prefer subtitles to appear later, pass `--lead-bias-ms 200` (or whatever offset you like) to push everything forward by that amount.
 
 ---
 

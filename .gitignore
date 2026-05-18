@@ -31,6 +31,7 @@ analyze_tests.py
 
 # IDEs
 .vscode/
+.claude/
 .idea/
 *.swp
 *.swo

@@ -29,6 +29,22 @@ except ImportError:
 
 from subsyncpro import __version__
 from subsyncpro.aligner import AlignResult, align
+
+
+def _apply_lead_bias(result: AlignResult, lead_bias_ms: float) -> None:
+    """Shift the aligned timeline by *lead_bias_ms* (in milliseconds).
+
+    A positive value pushes subtitles later (use when translator-leading is
+    making the synced subs appear too early).  Mutates *result* in place,
+    including each piecewise segment's offset so that the piecewise writer
+    applies the bias uniformly.
+    """
+    if not lead_bias_ms:
+        return
+    result.offset_ms += lead_bias_ms
+    if result.segments:
+        for seg in result.segments:
+            seg.offset_ms += lead_bias_ms
 from subsyncpro.extractor import (
     extract_best_subtitle,
     format_track_table,
@@ -122,6 +138,11 @@ def _build_parser() -> argparse.ArgumentParser:
     alg.add_argument("--offset-hint", metavar="MS", type=float, default=None,
                      help="Rough offset hint in milliseconds.  Speeds up search when you already "
                           "know the approximate delay (e.g. from a previous run).")
+    alg.add_argument("--lead-bias-ms", metavar="MS", type=float, default=0.0,
+                     help="Constant bias (ms) added to every aligned timestamp AFTER alignment. "
+                          "Use a negative value (e.g. -150) when the translated subtitle was "
+                          "deliberately timed to appear before the audio for reading time, and "
+                          "you want to remove that lead.  Default: 0 (keep translator intent).")
 
     # MKV options
     mkv = p.add_argument_group("MKV / reference video options")
@@ -319,6 +340,7 @@ def _run_sync(
     verbose: bool,
     dry_run: bool,
     output_format: str,
+    lead_bias_ms: float = 0.0,
 ) -> dict:
     """Internal sync runner shared by CLI and programmatic API."""
     # ── Load reference ────────────────────────────────────────────────────
@@ -351,6 +373,7 @@ def _run_sync(
         max_offset_s=max_offset_s,
         verbose=verbose,
     )
+    _apply_lead_bias(result, lead_bias_ms)
 
     # ── Apply transform ───────────────────────────────────────────────────
     synced_events = apply_transform(unsync_events, result)
@@ -492,6 +515,7 @@ def main(argv: list[str] | None = None) -> None:
             max_offset_s=args.max_offset,
             verbose=args.verbose,
         )
+        _apply_lead_bias(result, args.lead_bias_ms)
 
         # ── Apply & write ─────────────────────────────────────────────────
         if progress_ctx:
