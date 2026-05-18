@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subsyncpro"
+version = "1.0.0"
+description = "Subtitle synchronization tool — align any subtitle using a reference subtitle or MKV file. No audio required."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "SubSyncPro" }]
+keywords = ["subtitle", "sync", "srt", "ass", "mkv", "synchronization"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "chardet>=5.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+subsyncpro = "subsyncpro.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["subsyncpro*"]

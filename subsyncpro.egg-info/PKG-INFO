@@ -1,0 +1,256 @@
+Metadata-Version: 2.4
+Name: subsyncpro
+Version: 1.0.0
+Summary: Subtitle synchronization tool — align any subtitle using a reference subtitle or MKV file. No audio required.
+Author: SubSyncPro
+License: MIT
+Keywords: subtitle,sync,srt,ass,mkv,synchronization
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Intended Audience :: End Users/Desktop
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Multimedia :: Video
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: chardet>=5.0
+Requires-Dist: rich>=13.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+
+# SubSyncPro
+
+**The subtitle synchronisation tool that actually works — even when the reference has extra content.**
+
+Synchronise any subtitle file using a reference subtitle or an MKV with embedded subtitles.  
+No audio extraction. No re-encoding. Pure subtitle-to-subtitle alignment.
+
+---
+
+## Features
+
+| Feature | Details |
+|---|---|
+| **Formats** | SRT, ASS/SSA, WebVTT (read & write) |
+| **Reference** | Any subtitle file *or* an MKV/MP4/TS/… with embedded subtitles |
+| **Content-gap handling** | Works when reference has "Previously on…", opening credits, or bonus scenes not present in the unsync subtitle |
+| **Drift correction** | Optional linear mode corrects frame-rate differences (23.976 vs 25 fps, etc.) |
+| **Confidence score** | Reports how reliable the alignment is; warns when it might be wrong |
+| **Dry run** | Preview the offset without writing any file |
+| **Round-trip fidelity** | ASS styling/fonts/effects preserved exactly; only timestamps change |
+| **Fast** | A 45-minute episode aligns in under 5 seconds |
+
+---
+
+## Installation
+
+### Requirements
+
+- Python 3.9+
+- [FFmpeg](https://ffmpeg.org/download.html) on your PATH (only needed for MKV/video reference files)
+
+### From source (recommended)
+
+```bash
+git clone https://github.com/yourname/subsyncpro.git
+cd subsyncpro
+pip install -e .
+```
+
+### From PyPI (once published)
+
+```bash
+pip install subsyncpro
+```
+
+### Quick dependency install
+
+```bash
+pip install numpy scipy chardet rich
+```
+
+---
+
+## Quick Start
+
+```bash
+# Basic: sync using a reference SRT
+subsyncpro reference.srt unsynced.srt
+
+# Output: unsynced.synced.srt (created next to the input file)
+```
+
+```bash
+# Use an MKV file as reference
+subsyncpro episode.mkv unsynced.srt
+```
+
+```bash
+# Dry run — see the offset before touching any file
+subsyncpro reference.srt unsynced.srt --dry-run --verbose
+```
+
+---
+
+## Usage
+
+```
+subsyncpro REF UNSYNC [options]
+```
+
+### Positional arguments
+
+| Argument | Description |
+|---|---|
+| `REF` | Reference subtitle (`.srt`, `.ass`, `.vtt`) **or** a video file (`.mkv`, `.mp4`, `.avi`, …) with embedded subtitles |
+| `UNSYNC` | The subtitle you want to synchronise |
+
+### Output options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o`, `--output PATH` | `UNSYNC.synced.srt` | Output file path |
+| `-f`, `--format {srt,ass,vtt,auto}` | `auto` | Output format (`auto` = same as UNSYNC) |
+| `--encoding ENC` | auto-detect | Encoding for reading subtitle files (e.g. `utf-8`, `cp1252`) |
+| `--output-encoding ENC` | `utf-8` | Encoding for the output file |
+
+### Alignment options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-m`, `--mode {auto,offset,linear}` | `auto` | Alignment mode (see below) |
+| `--max-offset SECONDS` | `600` | Maximum expected offset in seconds. Increase for content with very long gaps |
+| `--offset-hint MS` | — | Approximate offset in milliseconds (speeds up search if you already know it) |
+
+**Modes:**
+
+- **`offset`** — Find a single constant shift (ms) to apply to all timestamps. Fast and accurate for 99% of cases.
+- **`linear`** — Also correct slight speed drift (e.g. PAL 25 fps vs NTSC 23.976 fps). Use when you see the subtitles drifting apart over time.
+- **`auto`** *(default)* — Try linear; if the drift is negligible (<0.05%), use pure offset.
+
+### MKV / video reference options
+
+| Flag | Description |
+|---|---|
+| `--list-tracks` | List all subtitle tracks in the video file and exit |
+| `--ref-track IDX` | Stream index of the subtitle track to use |
+| `--ref-lang LANG` | Preferred language when auto-selecting (e.g. `eng`, `jpn`) |
+
+### Behaviour options
+
+| Flag | Description |
+|---|---|
+| `-n`, `--dry-run` | Compute alignment and display results without writing |
+| `-v`, `--verbose` | Show detailed progress (fingerprint sizes, anchor counts, RANSAC stats) |
+| `--confidence-threshold 0-1` | Warn when confidence is below this level (default: 0.3) |
+| `--version` | Print version and exit |
+
+---
+
+## Examples
+
+```bash
+# List all subtitle tracks in an MKV
+subsyncpro --list-tracks episode.mkv unsynced.srt
+#   IDX  CODEC         LANG    DEF  FORCED   SDH  TITLE
+#   ─────────────────────────────────────────────────────
+#     2  subrip        eng      yes      no    no  English
+#     3  subrip        jpn       no      no    no  Japanese
+#     4  hdmv_pgs_sub  eng       no     yes   yes  English (Forced)
+
+# Use track 3 and force ASS output
+subsyncpro --ref-track 3 episode.mkv unsynced.srt -f ass
+
+# Handle 10+ minute gap (e.g. reference covers two episodes)
+subsyncpro reference.srt unsynced.srt --max-offset 1800
+
+# Correct frame-rate drift between NTSC and PAL sources
+subsyncpro reference.srt unsynced.srt --mode linear --verbose
+
+# Sync an ASS subtitle; preserve all styles and fonts
+subsyncpro reference.srt styled.ass -o styled.synced.ass
+
+# Use as a library in Python
+python - <<'EOF'
+from subsyncpro import align_subtitles
+result = align_subtitles("reference.srt", "unsynced.srt")
+print(f"Offset: {result['offset_ms']:+.0f} ms  confidence: {result['confidence']:.0%}")
+EOF
+```
+
+---
+
+## How it works
+
+SubSyncPro uses a three-stage pipeline that significantly improves on the naive cross-correlation approach used by ffsubsync.
+
+### Stage 1 — Fingerprinting
+
+Both subtitle files are converted to binary time-series: a 1-D array sampled at 33 ms (≈ one video frame) where **1** = subtitle is displayed, **0** = silence.
+
+### Stage 2 — Coarse FFT alignment
+
+A global FFT cross-correlation gives a rough estimate of the offset in O(N log N) time. This is fast and usually within a few seconds of the truth, but it can be fooled by extra content in the reference (the "Previously on…" problem).
+
+### Stage 3 — Windowed anchor search + RANSAC
+
+This is the key innovation over ffsubsync:
+
+1. **Sliding windows**: 30-second windows are slid over the *unsync* fingerprint in 5-second steps.
+2. **Local matching**: Each window is matched against the *entire* reference fingerprint using normalised cross-correlation. This produces a set of `(unsync_time, ref_time)` anchor pairs.
+3. **RANSAC**: A robust linear fit is applied to the anchor pairs. Anchors that are consistent with the dominant relationship are *inliers*; the rest are *outliers*.
+
+**Why this handles content gaps:**  
+Windows from the episode content find correct matches in the reference and cluster tightly around the true offset. Windows that happen to match extra content (different episodes, "Previously on", etc.) produce inconsistent offsets and are rejected as RANSAC outliers. The result is correct even when a large fraction of the reference has no corresponding unsync content.
+
+### Stage 4 — Optional linear drift correction
+
+If `--mode linear` is used, RANSAC fits `ref_time = scale × unsync_time + offset` instead of a constant offset. This corrects systematic speed drift caused by different frame rates (23.976 → 25 fps introduces ~4.3% speedup over 45 minutes).
+
+---
+
+## Troubleshooting
+
+**"Low confidence" warning**
+
+- The reference subtitle doesn't match the episode well. Check `--list-tracks` if using MKV.
+- Try `--max-offset` with a larger value.
+- Try `--mode linear` if timestamps diverge over time.
+- Verbose mode (`-v`) shows the RANSAC anchor count — very few anchors means the fingerprints don't overlap well.
+
+**Output is still off by a constant amount**
+
+- Try adding `--offset-hint MS` with the approximate offset you already see.
+
+**Wrong track selected from MKV**
+
+- Run `--list-tracks` and use `--ref-track IDX` to pick the correct track.
+
+**"image-based track" error**
+
+- PGS (Blu-ray) and DVDSUB (DVD) are image formats that can't be parsed. Use `--ref-track` to select a text-based track (SRT/ASS) if one exists, or supply a `.srt` file directly.
+
+---
+
+## Supported container/subtitle formats
+
+| Format | Read | Write |
+|---|---|---|
+| SRT (SubRip) | ✓ | ✓ |
+| ASS / SSA | ✓ (full round-trip) | ✓ |
+| WebVTT | ✓ | ✓ |
+| MKV (embedded) | via ffmpeg | — |
+| MP4, AVI, TS, M2TS | via ffmpeg | — |
+
+---
+
+## License
+
+MIT

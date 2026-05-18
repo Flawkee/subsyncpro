@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+subsyncpro/__init__.py
+subsyncpro/__main__.py
+subsyncpro/aligner.py
+subsyncpro/cli.py
+subsyncpro/extractor.py
+subsyncpro/fingerprint.py
+subsyncpro/parser.py
+subsyncpro/transformer.py
+subsyncpro/writer.py
+subsyncpro.egg-info/PKG-INFO
+subsyncpro.egg-info/SOURCES.txt
+subsyncpro.egg-info/dependency_links.txt
+subsyncpro.egg-info/entry_points.txt
+subsyncpro.egg-info/requires.txt
+subsyncpro.egg-info/top_level.txt
