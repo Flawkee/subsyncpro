@@ -523,6 +523,67 @@ def _fit_segment_offsets(
     return scale, float(best_intercept), confidence, n_inliers
 
 
+# ── event-pair refinement ─────────────────────────────────────────────────────
+
+def _refine_with_event_pairs(
+    ref_events: list[SubtitleEvent],
+    uns_events: list[SubtitleEvent],
+    rough_scale: float,
+    rough_offset_ms: float,
+    tolerance_ms: float = 5_000.0,
+) -> tuple[float, float, list[dict], float] | None:
+    """Refine a rough (scale, offset) by matching individual subtitle events.
+
+    Predicts the reference-time position of each unsync event using the rough
+    model, finds the nearest reference event within *tolerance_ms*, then runs
+    _ransac_linear() on the resulting anchor pairs.
+
+    This is more precise than segment-level binary cross-correlation because:
+    - Each pair is a point measurement — no spatial smearing from a 5-min window.
+    - RANSAC over hundreds of pairs provides a much tighter linear fit than the
+      ~10–25 segment-level estimates that the binary pass produces.
+
+    Critical for movies with PAL/NTSC drift: the rough segmented model may be
+    accurate to ~2.5 s at the start but <1 s at the end.  A ±5 s tolerance
+    window captures the correct English event for almost every Hebrew onset
+    throughout the film, yielding an accurate point-level scale and offset.
+
+    Returns (scale, offset_ms, inliers, confidence) or None when too few pairs.
+    """
+    if not ref_events or not uns_events:
+        return None
+
+    ref_starts = np.array([e.start_ms for e in ref_events], dtype=np.float64)
+    anchors: list[dict] = []
+
+    for ev in uns_events:
+        pred = rough_scale * ev.start_ms + rough_offset_ms
+        idx = int(np.searchsorted(ref_starts, pred))
+        best_dist = tolerance_ms + 1.0
+        best_ref_ms = None
+        for ci in (idx - 1, idx):
+            if 0 <= ci < len(ref_starts):
+                dist = abs(ref_starts[ci] - pred)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_ref_ms = float(ref_starts[ci])
+
+        if best_ref_ms is not None and best_dist <= tolerance_ms:
+            anchors.append({
+                "unsync_ms": float(ev.start_ms),
+                "ref_ms": best_ref_ms,
+                "offset_ms": best_ref_ms - float(ev.start_ms),
+                # Weight closer matches more — they are more likely to be
+                # correct and less dominated by mismatches near boundaries.
+                "score": max(0.1, 1.0 - best_dist / tolerance_ms),
+            })
+
+    if len(anchors) < max(_MIN_INLIERS * 2, 8):
+        return None
+
+    return _ransac_linear(anchors, seed_offset=rough_offset_ms)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def align(
@@ -751,6 +812,36 @@ def align(
                 if seg_conf2 >= seg_conf:
                     seg_scale, seg_off_ms, seg_conf, seg_n_in = seg_scale2, seg_off_ms2, seg_conf2, seg_n_in2
                     seg_n_total = len(seg_offsets2)
+
+            # Pass 3: event-pair refinement.
+            #
+            # The segmented binary model is accurate to within a few seconds.
+            # We use it to predict each unsync event's reference position and
+            # match to the nearest reference event within ±5 s.  RANSAC over
+            # these point-level pairs (typically hundreds) gives a much tighter
+            # (scale, offset) than the ~10–25 segment estimates above.
+            #
+            # Critical for PAL/NTSC drift: binary cross-correlation of a
+            # 5-min Hebrew segment against a time-compressed English reference
+            # finds a biased peak (±1–4 s per segment), causing the fitted
+            # intercept to be off by up to 2.5 s.  Event-pair matching avoids
+            # this smearing because each pair is a single onset measurement.
+            ref_pairs = ref_dial if ref_dial else ref_fp_events
+            uns_pairs = uns_dial if uns_dial else uns_fp_events
+            refined = _refine_with_event_pairs(ref_pairs, uns_pairs, seg_scale, seg_off_ms)
+            if refined is not None:
+                r_scale, r_off, r_inliers, r_conf = refined
+                n_matched = int(len(r_inliers) / r_conf) if r_conf > 0 else 0
+                if verbose:
+                    log.info(
+                        "Event-pair refinement: scale=%.6f, offset=%+.3fs, "
+                        "confidence=%.0f%%, %d/%d matched pairs",
+                        r_scale, r_off / 1000, r_conf * 100,
+                        len(r_inliers), n_matched,
+                    )
+                if len(r_inliers) >= 8:
+                    seg_scale, seg_off_ms, seg_conf, seg_n_in = r_scale, r_off, r_conf, len(r_inliers)
+                    seg_n_total = n_matched
 
             if seg_conf > conf or len(inliers) < _MIN_INLIERS:
                 seg_mode = "linear" if abs(seg_scale - 1.0) > 1e-4 else "offset"
