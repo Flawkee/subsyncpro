@@ -27,6 +27,7 @@ MANIFEST
 .coverage
 htmlcov/
 .tox/
+analyze_tests.py
 
 # IDEs
 .vscode/
