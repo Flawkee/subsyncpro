@@ -92,8 +92,13 @@ def _require_binary(name: str) -> str:
 
 # ── track listing ─────────────────────────────────────────────────────────────
 
-def list_subtitle_tracks(mkv_path: str | Path) -> list[SubtitleTrack]:
-    """Return all subtitle tracks found in the container."""
+def list_subtitle_tracks(mkv_path: str | Path, timeout: int = 120) -> list[SubtitleTrack]:
+    """Return all subtitle tracks found in the container.
+
+    *timeout* (seconds) controls how long ffprobe is allowed to run.
+    The default of 120 s handles large files on slow HDD servers; raise it
+    further with ``--ffprobe-timeout`` if your storage is especially slow.
+    """
     ffprobe = _require_binary("ffprobe")
     cmd = [
         ffprobe, "-v", "quiet",
@@ -103,9 +108,12 @@ def list_subtitle_tracks(mkv_path: str | Path) -> list[SubtitleTrack]:
         str(mkv_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("ffprobe timed out while reading the MKV file.")
+        raise RuntimeError(
+            f"ffprobe timed out after {timeout} s while reading the MKV file.\n"
+            "If you are on a slow HDD server, raise the limit with --ffprobe-timeout."
+        )
 
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed:\n{result.stderr.strip()}")
@@ -181,8 +189,14 @@ def extract_subtitle_track(
     mkv_path: str | Path,
     track_index: int,
     output_path: str | Path,
+    timeout: int = 300,
 ) -> Path:
-    """Extract a specific subtitle track to *output_path* using ffmpeg."""
+    """Extract a specific subtitle track to *output_path* using ffmpeg.
+
+    *timeout* (seconds) controls how long each ffmpeg call is allowed to run.
+    300 s (5 min) is the default to handle large files on slow HDD servers;
+    raise it with ``--ffmpeg-timeout`` if extraction still times out.
+    """
     ffmpeg = _require_binary("ffmpeg")
     out = Path(output_path)
     cmd = [
@@ -194,9 +208,12 @@ def extract_subtitle_track(
         str(out),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg timed out while extracting subtitle track.")
+        raise RuntimeError(
+            f"ffmpeg timed out after {timeout} s while extracting subtitle track.\n"
+            "If you are on a slow HDD server, raise the limit with --ffmpeg-timeout."
+        )
 
     if result.returncode != 0:
         # Some codecs need explicit conversion
@@ -207,7 +224,7 @@ def extract_subtitle_track(
             "-y",
             str(out),
         ]
-        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=120)
+        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=timeout)
         if result2.returncode != 0:
             raise RuntimeError(
                 f"ffmpeg failed to extract track {track_index}:\n{result2.stderr.strip()}"
@@ -227,6 +244,8 @@ def extract_best_subtitle(
     preferred_index: Optional[int] = None,
     output_dir: Optional[str | Path] = None,
     prefer_sdh: bool = False,
+    ffprobe_timeout: int = 120,
+    ffmpeg_timeout: int = 300,
 ) -> tuple[Path, SubtitleTrack]:
     """Find and extract the best subtitle track from an MKV.
 
@@ -237,7 +256,7 @@ def extract_best_subtitle(
     if not mkv.exists():
         raise FileNotFoundError(f"MKV file not found: {mkv}")
 
-    tracks = list_subtitle_tracks(mkv)
+    tracks = list_subtitle_tracks(mkv, timeout=ffprobe_timeout)
     if not tracks:
         raise RuntimeError(f"No subtitle tracks found in {mkv.name}")
 
@@ -259,7 +278,7 @@ def extract_best_subtitle(
     ext = ext_map.get(track.format_hint, ".srt")
     out_path = Path(output_dir) / f"ref_track{track.index}{ext}"
 
-    extracted = extract_subtitle_track(mkv, track.index, out_path)
+    extracted = extract_subtitle_track(mkv, track.index, out_path, timeout=ffmpeg_timeout)
     return extracted, track
 
 

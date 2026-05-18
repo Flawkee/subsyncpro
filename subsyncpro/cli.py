@@ -133,6 +133,12 @@ def _build_parser() -> argparse.ArgumentParser:
     mkv.add_argument("--ref-lang", metavar="LANG", default=None,
                      help="Preferred language code when auto-selecting from a video file "
                           "(e.g. 'eng', 'jpn').  Default: English.")
+    mkv.add_argument("--ffprobe-timeout", metavar="SEC", type=int, default=120,
+                     help="Seconds to wait for ffprobe when reading a video file (default: 120). "
+                          "Increase on slow HDD servers with large files.")
+    mkv.add_argument("--ffmpeg-timeout", metavar="SEC", type=int, default=300,
+                     help="Seconds to wait for ffmpeg when extracting a subtitle track (default: 300). "
+                          "Increase on slow HDD servers with large files.")
 
     # Behaviour
     beh = p.add_argument_group("Behaviour")
@@ -410,7 +416,7 @@ def main(argv: list[str] | None = None) -> None:
         _print(f"Subtitle tracks in [bold]{ref_path.name}[/bold]:" if _HAS_RICH else
                f"Subtitle tracks in {ref_path.name}:")
         try:
-            tracks = list_subtitle_tracks(ref_path)
+            tracks = list_subtitle_tracks(ref_path, timeout=args.ffprobe_timeout)
         except RuntimeError as e:
             _err(str(e))
             sys.exit(1)
@@ -579,6 +585,8 @@ def _load_ref_raw(args: argparse.Namespace):
                 preferred_index=args.ref_track,
                 output_dir=tmp_dir,
                 prefer_sdh=unsync_is_sdh,
+                ffprobe_timeout=args.ffprobe_timeout,
+                ffmpeg_timeout=args.ffmpeg_timeout,
             )
         except RuntimeError as exc:
             _err(str(exc))
