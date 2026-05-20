@@ -35,6 +35,7 @@ The real world is messier. SubSyncPro was built for it.
 - **Cross-language subtitles**: binary speech-activity fingerprints that are language-agnostic
 - **SDH noise**: automatically strips `[dramatic music]`, `* *`, `♪ lyrics ♪` before correlation, eliminating false correlation peaks that would otherwise dominate
 - **Linear drift**: detects and corrects frame-rate mismatches (23.976 fps vs 25 fps, NTSC vs PAL sources) with per-segment offset fitting
+- **Self-correcting multi-pass sync**: after the first sync, SubSyncPro re-aligns its own output to catch any residual offset or frame-rate error the first pass left behind, repeating (up to `--passes`, default 3) until the result is a stable fixed point. This reliably recovers the exact frame-rate ratio even when the first pass snaps to a near-neighbour.
 
 ---
 
@@ -168,6 +169,8 @@ subsyncpro REF UNSYNC [options]
 | `--max-offset SECONDS` | `600` | Maximum expected timing difference in seconds. Raise to `1800` or more if the reference covers multiple episodes or has very long recap segments. |
 | `--offset-hint MS` | — | Rough offset hint in milliseconds. Optional speed-up when you already know the approximate delay from a previous run. |
 | `--lead-bias-ms MS` | `0` | Constant bias (ms) added to every timestamp *after* alignment. Use a positive value to push subtitles later (e.g. `--lead-bias-ms 200` to remove a translator's 200 ms reading-time lead). |
+| `--passes N` | `3` | Maximum sync passes. After the first sync the tool re-aligns its own output to shave off any residual offset / frame-rate error, stopping early once a pass finds nothing worth applying. Set `1` for a single pass. |
+| `--warp {auto,on,off}` | `auto` | Dense piecewise-linear warp for non-linear drift (edit cuts). `auto` builds a warp candidate and keeps it **only if hold-out cross-validation shows it beats a single line** — self-selecting per file. `on` forces it; `off` always uses a single `(scale, offset)`. |
 
 **Alignment modes:**
 
@@ -196,6 +199,7 @@ subsyncpro REF UNSYNC [options]
 | `-n`, `--dry-run` | off | Compute and display the alignment result without writing any output file. |
 | `-v`, `--verbose` | off | Print detailed internal stats: fingerprint sizes, anchor counts, per-segment offsets, RANSAC inlier rates. |
 | `--confidence-threshold 0–1` | `0.2` | Emit a warning (but still write the file) when the alignment confidence falls below this threshold. |
+| `--workers N` | `0` | CPU threads for the FFT correlation stages. `0` = auto (use all logical cores). Set to `1` to force single-threaded, or a specific number to cap CPU usage. The cross-correlation FFTs release the GIL, so this scales nearly linearly with core count. |
 | `--version` | — | Print the SubSyncPro version and exit. |
 
 ---

@@ -29,22 +29,6 @@ except ImportError:
 
 from subsyncpro import __version__
 from subsyncpro.aligner import AlignResult, align
-
-
-def _apply_lead_bias(result: AlignResult, lead_bias_ms: float) -> None:
-    """Shift the aligned timeline by *lead_bias_ms* (in milliseconds).
-
-    A positive value pushes subtitles later (use when translator-leading is
-    making the synced subs appear too early).  Mutates *result* in place,
-    including each piecewise segment's offset so that the piecewise writer
-    applies the bias uniformly.
-    """
-    if not lead_bias_ms:
-        return
-    result.offset_ms += lead_bias_ms
-    if result.segments:
-        for seg in result.segments:
-            seg.offset_ms += lead_bias_ms
 from subsyncpro.extractor import (
     extract_best_subtitle,
     format_track_table,
@@ -135,9 +119,19 @@ def _build_parser() -> argparse.ArgumentParser:
     alg.add_argument("--max-offset", metavar="SECONDS", type=float, default=600.0,
                      help="Maximum expected timing difference in seconds (default: 600 = 10 min). "
                           "Increase for long-form content or when the reference covers multiple episodes.")
+    alg.add_argument("--passes", metavar="N", type=int, default=3,
+                     help="Maximum sync passes (default: 3).  After the first sync the tool "
+                          "re-aligns the result to shave off any residual offset, stopping early "
+                          "once a pass finds nothing worth applying.  Set 1 for a single pass.")
     alg.add_argument("--offset-hint", metavar="MS", type=float, default=None,
                      help="Rough offset hint in milliseconds.  Speeds up search when you already "
                           "know the approximate delay (e.g. from a previous run).")
+    alg.add_argument("--warp", choices=["auto", "on", "off"], default="auto",
+                     help="Dense piecewise-linear warp for non-linear drift (edit cuts).\n"
+                          "  auto  — build a warp and keep it only if hold-out cross-validation\n"
+                          "          shows it beats a single line (default; self-selects per file)\n"
+                          "  on    — force the warp whenever one can be built\n"
+                          "  off   — always use a single (scale, offset)")
     alg.add_argument("--lead-bias-ms", metavar="MS", type=float, default=0.0,
                      help="Constant bias (ms) added to every aligned timestamp AFTER alignment. "
                           "Use a negative value (e.g. -150) when the translated subtitle was "
@@ -160,6 +154,13 @@ def _build_parser() -> argparse.ArgumentParser:
     mkv.add_argument("--ffmpeg-timeout", metavar="SEC", type=int, default=300,
                      help="Seconds to wait for ffmpeg when extracting a subtitle track (default: 300). "
                           "Increase on slow HDD servers with large files.")
+
+    # Performance
+    perf = p.add_argument_group("Performance")
+    perf.add_argument("--workers", metavar="N", type=int, default=0,
+                      help="CPU threads for the FFT correlation stages "
+                           "(default: 0 = auto, use all logical cores).  Set to 1 to force "
+                           "single-threaded, or a specific number to cap CPU usage.")
 
     # Behaviour
     beh = p.add_argument_group("Behaviour")
@@ -325,6 +326,111 @@ def _render_result(result: AlignResult, delta: dict, dry_run: bool) -> None:
     console.print(Panel(tbl, title=title, border_style="blue"))
 
 
+# ── iterative (multi-pass) sync ───────────────────────────────────────────────
+
+# A refinement pass re-aligns the already-synced subtitle against the reference.
+# After the first pass the timing is close, so the windowed anchor search locks
+# on with high confidence and can shave off any residual the first pass left
+# (common when the first pass had to use the low-confidence cross-language
+# fallback).  Passes stop early once a pass finds nothing worth applying.
+_CONVERGE_OFFSET_MS: float = 60.0    # residual shift below this = converged
+_CONVERGE_SCALE: float = 5e-5        # residual scale within this of 1 = converged
+_REFINE_MIN_CONF: float = 0.5        # don't trust a refinement below this confidence
+_REFINE_MAX_OFFSET_MS: float = 5_000.0  # a refinement shouldn't find a huge new shift
+
+
+def _shift_events(events: list, ms: float):
+    """Apply a constant millisecond shift (used for --lead-bias-ms)."""
+    if not ms:
+        return events
+    bias = AlignResult(offset_ms=float(ms), scale=1.0, confidence=1.0,
+                       n_anchors=0, n_inliers=0, coarse_offset_ms=0.0,
+                       mode_used="lead-bias")
+    return apply_transform(events, bias)
+
+
+def _sync_passes(
+    ref_events: list,
+    unsync_events: list,
+    *,
+    mode: str,
+    max_offset_s: float,
+    verbose: bool,
+    workers: int,
+    warp: str,
+    max_passes: int,
+):
+    """Align, then re-align the synced result up to *max_passes* times.
+
+    Returns (synced_events, [AlignResult per applied pass]).  The first pass is
+    always applied; each subsequent pass is applied only if it finds a
+    trustworthy, non-trivial, plausibly-sized correction — otherwise iteration
+    stops (the result has converged).
+
+    A non-linear warp (if any) is only considered on the first pass; refinement
+    passes are pure linear clean-ups of the residual offset / frame-rate error.
+    """
+    working = unsync_events
+    applied: list[AlignResult] = []
+    for p in range(max(1, max_passes)):
+        warp_this_pass = warp if p == 0 else "off"
+        r = align(ref_events, working, mode=mode, max_offset_s=max_offset_s,
+                  verbose=verbose, workers=workers, warp=warp_this_pass)
+        has_warp = bool(r.segments and len(r.segments) > 1)
+
+        if p > 0:
+            resid_off = abs(r.offset_ms)
+            resid_scale = abs(r.scale - 1.0)
+            if not has_warp and resid_off < _CONVERGE_OFFSET_MS and resid_scale < _CONVERGE_SCALE:
+                if verbose:
+                    logging.info("Pass %d: residual %+.0f ms / scale %.6f within tolerance — converged.",
+                                 p + 1, r.offset_ms, r.scale)
+                break
+            if r.confidence < _REFINE_MIN_CONF:
+                if verbose:
+                    logging.info("Pass %d: confidence %.0f%% too low to trust a refinement — stopping.",
+                                 p + 1, r.confidence * 100)
+                break
+            if not has_warp and resid_off > _REFINE_MAX_OFFSET_MS:
+                if verbose:
+                    logging.info("Pass %d: implausibly large new shift %+.0f ms — stopping.",
+                                 p + 1, r.offset_ms)
+                break
+            if verbose:
+                logging.info("Pass %d: applying refinement offset=%+.0f ms scale=%.6f conf=%.0f%%",
+                             p + 1, r.offset_ms, r.scale, r.confidence * 100)
+
+        working = apply_transform(working, r)
+        applied.append(r)
+
+    return working, applied
+
+
+def _composed_result(orig: list, synced: list, passes: list[AlignResult]) -> AlignResult:
+    """Build a display AlignResult describing the *net* transform across passes.
+
+    The written file is *synced* itself; this is only for the result panel, so
+    the effective (scale, offset) is recovered by a least-squares fit of the
+    final timestamps against the originals.
+    """
+    import numpy as np
+    base = passes[0]
+    x = np.array([e.start_ms for e in orig], dtype=float)
+    y = np.array([e.start_ms for e in synced], dtype=float)
+    if len(x) >= 2 and float(x.max() - x.min()) > 0:
+        a = np.vstack([x, np.ones_like(x)]).T
+        s, o = np.linalg.lstsq(a, y, rcond=None)[0]
+        s, o = float(s), float(o)
+    else:
+        s, o = 1.0, (float(np.median(y - x)) if len(x) else 0.0)
+    n = len(passes)
+    mode = base.mode_used + (f"  ({n} passes)" if n > 1 else "")
+    return AlignResult(offset_ms=o, scale=s, confidence=base.confidence,
+                       n_anchors=base.n_anchors, n_inliers=base.n_inliers,
+                       coarse_offset_ms=base.coarse_offset_ms, mode_used=mode,
+                       segments=None)
+
+
 # ── core sync function (reused by __init__.align_subtitles) ──────────────────
 
 def _run_sync(
@@ -341,6 +447,9 @@ def _run_sync(
     dry_run: bool,
     output_format: str,
     lead_bias_ms: float = 0.0,
+    workers: int = 0,
+    warp: str = "auto",
+    passes: int = 3,
 ) -> dict:
     """Internal sync runner shared by CLI and programmatic API."""
     # ── Load reference ────────────────────────────────────────────────────
@@ -366,18 +475,19 @@ def _run_sync(
             len(ref_events), len(unsync_events),
         )
 
-    # ── Align ─────────────────────────────────────────────────────────────
-    result = align(
+    # ── Align (iteratively) ───────────────────────────────────────────────
+    synced_events, pass_results = _sync_passes(
         ref_events, unsync_events,
         mode=mode,
         max_offset_s=max_offset_s,
         verbose=verbose,
+        workers=workers,
+        warp=warp,
+        max_passes=passes,
     )
-    _apply_lead_bias(result, lead_bias_ms)
-
-    # ── Apply transform ───────────────────────────────────────────────────
-    synced_events = apply_transform(unsync_events, result)
-    delta = compute_delta_summary(unsync_events, synced_events)
+    if lead_bias_ms:
+        synced_events = _shift_events(synced_events, lead_bias_ms)
+    result = _composed_result(unsync_events, synced_events, pass_results)
 
     # ── Write output ──────────────────────────────────────────────────────
     out_fmt = output_format if output_format != "auto" else unsync_fmt
@@ -505,23 +615,27 @@ def main(argv: list[str] | None = None) -> None:
             _err("Unsynchronised subtitle appears to be empty.")
             sys.exit(1)
 
-        # ── Align ─────────────────────────────────────────────────────────
+        # ── Align (iteratively) ───────────────────────────────────────────
         if progress_ctx:
             progress_ctx.update(task, description="Aligning… (fingerprinting + RANSAC)")
 
-        result: AlignResult = align(
+        synced_events, pass_results = _sync_passes(
             ref_events, unsync_events,
             mode=args.mode,
             max_offset_s=args.max_offset,
             verbose=args.verbose,
+            workers=args.workers,
+            warp=args.warp,
+            max_passes=args.passes,
         )
-        _apply_lead_bias(result, args.lead_bias_ms)
+        if args.lead_bias_ms:
+            synced_events = _shift_events(synced_events, args.lead_bias_ms)
+        result = _composed_result(unsync_events, synced_events, pass_results)
 
-        # ── Apply & write ─────────────────────────────────────────────────
+        # ── Write ──────────────────────────────────────────────────────────
         if progress_ctx:
-            progress_ctx.update(task, description="Applying transform…")
+            progress_ctx.update(task, description="Writing output…")
 
-        synced_events = apply_transform(unsync_events, result)
         delta = compute_delta_summary(unsync_events, synced_events)
 
         out_fmt = args.format if args.format != "auto" else unsync_fmt

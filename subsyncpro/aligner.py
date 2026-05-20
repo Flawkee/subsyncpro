@@ -26,11 +26,14 @@ cluster — the true episode content — survives, giving the correct offset.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve
 
 from subsyncpro.fingerprint import (
@@ -216,7 +219,7 @@ class AlignResult:
         s += f"  confidence={self.confidence:.0%}"
         s += f"  anchors={self.n_inliers}/{self.n_anchors}"
         if self.segments and len(self.segments) > 1:
-            s += f"  [piecewise: {len(self.segments)} segments]"
+            s += f"  [dense warp: {len(self.segments)} segments]"
         return s
 
 
@@ -250,6 +253,51 @@ def _parabolic_peak(corr: np.ndarray, k: int) -> float:
     return float(k) + delta
 
 
+# ── shared-FFT cross-correlation ──────────────────────────────────────────────
+
+def _resolve_workers(workers: int | None) -> int:
+    """Resolve a user *workers* request to a concrete thread count.
+
+    0 / None / negative → auto (all logical CPUs).  Otherwise clamp to
+    [1, cpu_count] so an over-large request can't oversubscribe.
+    """
+    cpu = os.cpu_count() or 1
+    if not workers or workers <= 0:
+        return cpu
+    return min(int(workers), cpu)
+
+
+def _precompute_ref_fft(
+    ref: np.ndarray, kernel_len: int, workers: int = 1,
+) -> tuple[np.ndarray, int]:
+    """Return (rfft(ref) at a shared FFT size, fftsize) for valid-mode
+    correlation against a *fixed-length* kernel.
+
+    The reference FFT is the dominant cost in the windowed and segmented
+    searches, yet the reference is identical across every window/segment and
+    the kernel length is constant — so the transform can be computed once and
+    reused, instead of being recomputed inside fftconvolve on each iteration.
+    """
+    fftsize = int(next_fast_len(len(ref) + kernel_len - 1))
+    ref_f = rfft(ref, fftsize, workers=workers)
+    return ref_f, fftsize
+
+
+def _corr_valid_with_ref_fft(
+    ref_f: np.ndarray, ref_len: int, kernel: np.ndarray, fftsize: int,
+) -> np.ndarray:
+    """Valid-mode cross-correlation using a precomputed reference FFT.
+
+    Equivalent to ``fftconvolve(ref, kernel, mode="valid")`` where *kernel* is
+    already reversed by the caller (i.e. pass ``window_zm[::-1]``).  Returns
+    the valid region, length ``ref_len - len(kernel) + 1``.
+    """
+    m = len(kernel)
+    kf = rfft(kernel, fftsize)
+    full = irfft(ref_f * kf, fftsize)
+    return full[m - 1 : ref_len]
+
+
 # ── coarse FFT alignment ──────────────────────────────────────────────────────
 
 def _coarse_offset(ref_fp: np.ndarray, uns_fp: np.ndarray, resolution_ms: int) -> float:
@@ -275,6 +323,7 @@ def _find_anchors(
     ref_fp: np.ndarray,
     uns_fp: np.ndarray,
     resolution_ms: int,
+    workers: int = 1,
 ) -> list[dict]:
     """Slide a window across uns_fp and find its best match in ref_fp.
 
@@ -282,6 +331,12 @@ def _find_anchors(
         = dot(ref_fp[k : k+win_n], window)
 
     So argmax gives ref_start directly (0-indexed).
+
+    Every window correlates against the *same* ref_fp, so its FFT is computed
+    once up front (``_precompute_ref_fft``) and reused, and the independent
+    per-window work is spread across *workers* threads.  NumPy/SciPy FFTs
+    release the GIL, so threading gives near-linear scaling.  Results are
+    collected in window order so the downstream RANSAC is deterministic.
 
     Returns list of anchor dicts: {unsync_ms, ref_ms, offset_ms, score}.
     """
@@ -291,46 +346,51 @@ def _find_anchors(
     if len(ref_fp) < win_n:
         return []
 
-    anchors: list[dict] = []
+    ref_len = len(ref_fp)
+    ref_f, fftsize = _precompute_ref_fft(ref_fp, win_n, workers=workers)
 
-    for pos in range(0, len(uns_fp) - win_n + 1, step_n):
+    positions = [
+        pos for pos in range(0, len(uns_fp) - win_n + 1, step_n)
+        if window_has_content(uns_fp[pos : pos + win_n])
+    ]
+
+    def _process(pos: int) -> dict | None:
         window = uns_fp[pos : pos + win_n]
-        if not window_has_content(window):
-            continue
-
         # Zero-mean the window before correlating.  This removes the DC
         # component so that windows with uniformly distributed events produce
         # near-zero correlation at wrong offsets, while genuine matches stand
         # out clearly.  Without this, positive-only onset impulses create
         # spurious high-scoring matches wherever the reference is dense.
         window_zm = window - window.mean()
-        corr = fftconvolve(ref_fp, window_zm[::-1], mode="valid")
+        window_energy = float(np.dot(window_zm, window_zm))
+        if window_energy < 1e-9:
+            return None
+        corr = _corr_valid_with_ref_fft(ref_f, ref_len, window_zm[::-1], fftsize)
         ref_start_int = int(np.argmax(corr))
         ref_start = _parabolic_peak(corr, ref_start_int)
 
         # Normalise by the energy of the zero-mean window (L2 norm).
         # This gives a Pearson-like score in [0, 1] when both signals align.
-        window_energy = float(np.dot(window_zm, window_zm))
-        if window_energy < 1e-9:
-            continue
         score = float(corr[ref_start_int]) / window_energy
-
         if score < _MIN_SCORE:
-            continue
+            return None
 
         ref_center_ms = (ref_start + win_n / 2) * resolution_ms
         uns_center_ms = (pos + win_n / 2) * resolution_ms
+        return {
+            "unsync_ms": float(uns_center_ms),
+            "ref_ms": float(ref_center_ms),
+            "offset_ms": float(ref_center_ms - uns_center_ms),
+            "score": score,
+        }
 
-        anchors.append(
-            {
-                "unsync_ms": float(uns_center_ms),
-                "ref_ms": float(ref_center_ms),
-                "offset_ms": float(ref_center_ms - uns_center_ms),
-                "score": score,
-            }
-        )
+    if workers > 1 and len(positions) > 8:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            mapped = list(ex.map(_process, positions))
+    else:
+        mapped = [_process(pos) for pos in positions]
 
-    return anchors
+    return [a for a in mapped if a is not None]
 
 
 # ── RANSAC: constant offset ───────────────────────────────────────────────────
@@ -478,6 +538,7 @@ def _segmented_binary_alignment(
     seed_scale: float | None = None,
     seed_offset_ms: float | None = None,
     refine_radius_ms: float = 3_000,
+    workers: int = 1,
 ) -> list[tuple[float, float, float]]:
     """Segment-by-segment binary cross-correlation against the full reference.
 
@@ -502,20 +563,31 @@ def _segmented_binary_alignment(
     seg_n = _SEG_MS // resolution_ms
     narrow = seed_scale is not None and seed_offset_ms is not None
     radius_n = max(1, int(refine_radius_ms / resolution_ms))
-    results: list[tuple[float, float, float]] = []
+    ref_len = len(ref_fp_bin)
 
-    for seg_start in range(0, len(uns_fp_bin) - seg_n + 1, seg_n):
+    # The full-range pass correlates every segment against the same reference
+    # with a fixed kernel length, so its FFT is precomputed once and reused.
+    # The narrow pass uses a different (small) ref slice per segment, so it
+    # stays on fftconvolve — it is already cheap.
+    ref_f: np.ndarray | None = None
+    fftsize = 0
+    if not narrow and ref_len >= seg_n:
+        ref_f, fftsize = _precompute_ref_fft(ref_fp_bin, seg_n, workers=workers)
+
+    seg_starts = list(range(0, len(uns_fp_bin) - seg_n + 1, seg_n))
+
+    def _process(seg_start: int) -> tuple[float, float, float] | None:
         seg_end = seg_start + seg_n
         uns_seg = uns_fp_bin[seg_start:seg_end]
 
         density = float(uns_seg.mean())
         if density < 0.03 or density > 0.97:
-            continue  # too sparse or fully saturated — no useful structure
+            return None  # too sparse or fully saturated — no useful structure
 
         uns_zm = uns_seg - density
         energy = float(np.dot(uns_zm, uns_zm))
         if energy < 1.0:
-            continue
+            return None
 
         uns_center_ms = float((seg_start + seg_end) / 2 * resolution_ms)
 
@@ -526,18 +598,18 @@ def _segmented_binary_alignment(
             lo = max(0, pred_k - radius_n)
             hi = min(len(ref_fp_bin) - seg_n, pred_k + radius_n)
             if hi < lo:
-                continue
+                return None
             ref_slice = ref_fp_bin[lo : hi + seg_n]
             corr = fftconvolve(ref_slice, uns_zm[::-1], mode="valid")
             if len(corr) == 0:
-                continue
+                return None
             local_idx_int = int(np.argmax(corr))
             local_idx = _parabolic_peak(corr, local_idx_int)
             best_k = lo + local_idx
         else:
-            corr = fftconvolve(ref_fp_bin, uns_zm[::-1], mode="valid")
+            corr = _corr_valid_with_ref_fft(ref_f, ref_len, uns_zm[::-1], fftsize)  # type: ignore[arg-type]
             if len(corr) == 0:
-                continue
+                return None
             local_idx_int = int(np.argmax(corr))
             local_idx = _parabolic_peak(corr, local_idx_int)
             best_k = local_idx
@@ -545,7 +617,7 @@ def _segmented_binary_alignment(
         local_off_ms = float((best_k - seg_start) * resolution_ms)
 
         if not narrow and abs(local_off_ms) > max_offset_ms:
-            continue  # plausibility filter only needed for full-range pass
+            return None  # plausibility filter only needed for full-range pass
 
         # SNR: correlation peak value divided by mean of ±radius neighbourhood.
         lo_w = max(0, local_idx_int - radius_n)
@@ -553,9 +625,15 @@ def _segmented_binary_alignment(
         noise = float(np.mean(np.abs(corr[lo_w:hi_w])))
         snr = float(corr[local_idx_int]) / (noise + 1e-9)
 
-        results.append((uns_center_ms, local_off_ms, snr))
+        return (uns_center_ms, local_off_ms, snr)
 
-    return results
+    if workers > 1 and len(seg_starts) > 2:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            mapped = list(ex.map(_process, seg_starts))
+    else:
+        mapped = [_process(s) for s in seg_starts]
+
+    return [r for r in mapped if r is not None]
 
 
 def _fit_segment_offsets(
@@ -716,168 +794,213 @@ def _refine_with_event_pairs(
     return _ransac_linear(anchors, seed_offset=rough_offset_ms)
 
 
-# ── piecewise-linear fit ─────────────────────────────────────────────────────
+# ── dense piecewise-linear warp (experimental, opt-in) ────────────────────────
 
-# Tiny segments overfit noise — any segment must span at least this much time.
-_PIECEWISE_MIN_SEG_MS: int = 600_000   # 10 minutes
-# Below this anchor count the per-segment scale/offset are dominated by noise.
-_PIECEWISE_MIN_ANCHORS_PER_SEG: int = 30
-_PIECEWISE_MAX_DRIFT: float = _MAX_DRIFT
-# A real edit cut produces a fractional-second jump.  Larger discontinuities
-# usually indicate overfitting and trigger a fallback to single-segment.
-_PIECEWISE_MAX_JUMP_MS: float = 2_500.0
-# Raftery's "very strong evidence" threshold — ΔBIC > 10 to escalate k → k+1.
-_PIECEWISE_BIC_MARGIN: float = 10.0
-
-
-def _weighted_polyfit(xs: np.ndarray, ys: np.ndarray, ws: np.ndarray) -> tuple[float, float]:
-    coeffs = np.polyfit(xs, ys, 1, w=ws)
-    return float(coeffs[0]), float(coeffs[1])
-
-
-def _bic(rss: float, n_params: int, n_obs: int) -> float:
-    if n_obs <= 0 or rss <= 0:
-        return float("inf")
-    return n_obs * float(np.log(rss / n_obs)) + n_params * float(np.log(n_obs))
-
-
-def _fit_pieces(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    ws: np.ndarray,
-    breakpoints: list[float],
-) -> tuple[list[tuple[float, float, float, float]] | None, float]:
-    """Fit one weighted-linear model per segment between *breakpoints*.
-
-    Returns (segments, weighted_rss) or (None, inf) when constraints fail.
-    Each segment tuple is (start_ms, end_ms, scale, offset).
-    """
-    edges = [float(xs.min()) - 1.0] + list(breakpoints) + [float(xs.max()) + 1.0]
-    segs: list[tuple[float, float, float, float]] = []
-    total_rss = 0.0
-    for i in range(len(edges) - 1):
-        lo, hi = edges[i], edges[i + 1]
-        mask = (xs > lo) & (xs <= hi)
-        n = int(mask.sum())
-        if n < _PIECEWISE_MIN_ANCHORS_PER_SEG:
-            return None, float("inf")
-        xseg, yseg, wseg = xs[mask], ys[mask], ws[mask]
-        if float(xseg.max() - xseg.min()) < _PIECEWISE_MIN_SEG_MS:
-            return None, float("inf")
-        scale, offset = _weighted_polyfit(xseg, yseg, wseg)
-        if abs(scale - 1.0) > _PIECEWISE_MAX_DRIFT:
-            return None, float("inf")
-        pred = scale * xseg + offset
-        total_rss += float(np.sum(wseg * (yseg - pred) ** 2))
-        seg_start = float("-inf") if i == 0 else float(breakpoints[i - 1])
-        seg_end = float("inf") if i == len(edges) - 2 else float(breakpoints[i])
-        segs.append((seg_start, seg_end, scale, offset))
-    return segs, total_rss
+# A single (scale, offset) cannot follow a subtitle whose timing wanders
+# non-linearly against the reference.  The dense warp tries to track that drift
+# with a continuous, monotonic, piecewise-linear curve through robust local
+# estimates of the anchor pairs.
+#
+# IMPORTANT: for cross-language subtitles this is usually a NET LOSS.  Hold-out
+# validation on real files shows the per-window medians are dominated by the
+# translator's own line-by-line retiming, so fitting them overfits — the warp
+# improves the typical residual slightly but worsens the tail (large errors),
+# which is exactly what a viewer perceives as "out of sync" at the edges.
+# It is therefore OFF by default and only worth enabling for sources with a
+# genuine structural break (an edit cut / splice) the linear model can't span.
+_WARP_WINDOW_ANCHORS: int = 41     # anchors per local window (large = robust)
+_WARP_STEP_ANCHORS: int = 20       # step between window centres (overlap)
+_WARP_MIN_ANCHORS: int = 120       # need broad coverage before a warp is safe
+_WARP_MIN_KNOT_GAP_MS: float = 5_000.0   # merge knots closer than this in time
+_WARP_MIN_SEGMENTS: int = 3        # at least this many pieces or it's just linear
+# Clamp every knot to within this distance of the global line.  Stops the warp
+# from chasing outliers / mismatches into a large local error.
+_WARP_MAX_DEVIATION_MS: float = 1_000.0
+# Only prefer the warp when it bends at least this far from the line somewhere;
+# below this the data is effectively linear and the flat model is safer.
+_WARP_MIN_DEVIATION_MS: float = 250.0
 
 
-def _piecewise_linear_fit(
+def _dense_warp_from_pairs(
     anchors: list[dict],
+    global_scale: float,
+    global_offset_ms: float,
     *,
     verbose: bool = False,
-) -> tuple[list[tuple[float, float, float, float]] | None, dict]:
-    """Fit 1, 2 or 3 linear pieces to anchor pairs; pick by BIC.
+) -> list["Segment"] | None:
+    """Build a dense, continuous, monotonic piecewise-linear warp from anchor
+    pairs, or None when a single linear model is adequate / data is too sparse.
 
-    Returns the list of (start_ms, end_ms, scale, offset) segments when
-    piecewise is preferred, or None when single-linear wins.  Diagnostics
-    (BIC values, residuals) come back in a dict.
+    Knots are the (median unsync, median ref) of sliding windows — robust to the
+    occasional cross-language mismatch — clamped to within _WARP_MAX_DEVIATION_MS
+    of the global line so the warp can't run away from outliers.  Outside the
+    matched anchor range the warp falls back to the global line (no local-slope
+    extrapolation, which previously broke the intro/credits), and y-values are
+    forced monotonic so subtitle order is preserved.
     """
-    diag: dict = {}
-    if len(anchors) < _PIECEWISE_MIN_ANCHORS_PER_SEG * 2:
-        diag["reason"] = "too few anchors"
-        return None, diag
+    if len(anchors) < _WARP_MIN_ANCHORS:
+        return None
 
-    xs = np.array([a["unsync_ms"] for a in anchors], dtype=np.float64)
-    ys = np.array([a["ref_ms"] for a in anchors], dtype=np.float64)
-    ws = np.array([a["score"] for a in anchors], dtype=np.float64)
-    order = np.argsort(xs)
-    xs, ys, ws = xs[order], ys[order], ws[order]
-    n_obs = len(xs)
+    uns = np.array([a["unsync_ms"] for a in anchors], dtype=np.float64)
+    ref = np.array([a["ref_ms"] for a in anchors], dtype=np.float64)
+    order = np.argsort(uns)
+    uns, ref = uns[order], ref[order]
 
-    scale1, offset1 = _weighted_polyfit(xs, ys, ws)
-    if abs(scale1 - 1.0) > _PIECEWISE_MAX_DRIFT:
-        diag["reason"] = "single-segment scale out of range"
-        return None, diag
-    pred1 = scale1 * xs + offset1
-    rss1 = float(np.sum(ws * (ys - pred1) ** 2))
-    bic1 = _bic(rss1, 2, n_obs)
-    diag["bic"] = {1: bic1}
-    diag["single"] = (scale1, offset1)
+    # Sliding-window robust knots.
+    kx: list[float] = []
+    ky: list[float] = []
+    for s in range(0, len(uns) - _WARP_WINDOW_ANCHORS + 1, _WARP_STEP_ANCHORS):
+        w = slice(s, s + _WARP_WINDOW_ANCHORS)
+        kx.append(float(np.median(uns[w])))
+        ky.append(float(np.median(ref[w])))
+    tail = slice(len(uns) - _WARP_WINDOW_ANCHORS, len(uns))
+    kx.append(float(np.median(uns[tail])))
+    ky.append(float(np.median(ref[tail])))
 
-    # Candidate breakpoints at quantile positions of the unsync domain.
-    n_candidates = 60
-    qs = np.linspace(0.08, 0.92, n_candidates)
-    cand_bps = np.quantile(xs, qs)
+    # Enforce a minimum time gap between knots (avoids near-vertical segments).
+    fkx: list[float] = [kx[0]]
+    fky: list[float] = [ky[0]]
+    for x, y in zip(kx[1:], ky[1:]):
+        if x - fkx[-1] >= _WARP_MIN_KNOT_GAP_MS:
+            fkx.append(x)
+            fky.append(y)
+    if len(fkx) < _WARP_MIN_SEGMENTS + 1:
+        return None
 
-    best2_rss = float("inf")
-    best2_segs = None
-    best2_bp: float | None = None
-    for bp in cand_bps:
-        segs, rss = _fit_pieces(xs, ys, ws, [float(bp)])
-        if rss < best2_rss:
-            best2_rss = rss
-            best2_segs = segs
-            best2_bp = float(bp)
-    bic2 = _bic(best2_rss, 5, n_obs) if best2_segs else float("inf")
-    diag["bic"][2] = bic2
-    diag["bp2"] = best2_bp
+    kxa = np.array(fkx)
+    kya = np.array(fky)
 
-    best3_rss = float("inf")
-    best3_segs = None
-    best3_bps: list[float] | None = None
-    if bic2 < bic1:
-        for i, b1 in enumerate(cand_bps):
-            for b2 in cand_bps[i + 1:]:
-                if b2 - b1 < _PIECEWISE_MIN_SEG_MS:
-                    continue
-                segs, rss = _fit_pieces(xs, ys, ws, [float(b1), float(b2)])
-                if rss < best3_rss:
-                    best3_rss = rss
-                    best3_segs = segs
-                    best3_bps = [float(b1), float(b2)]
-    bic3 = _bic(best3_rss, 8, n_obs) if best3_segs else float("inf")
-    diag["bic"][3] = bic3
-    diag["bp3"] = best3_bps
+    # Clamp every knot to within a bounded band of the global line, then force
+    # monotonic y so corrected timestamps never go backwards.
+    gline = global_scale * kxa + global_offset_ms
+    kya = np.clip(kya, gline - _WARP_MAX_DEVIATION_MS, gline + _WARP_MAX_DEVIATION_MS)
+    for i in range(1, len(kya)):
+        if kya[i] < kya[i - 1]:
+            kya[i] = kya[i - 1]
 
-    best_k = 1
-    if bic2 + _PIECEWISE_BIC_MARGIN < bic1:
-        best_k = 2
-        if bic3 + _PIECEWISE_BIC_MARGIN < bic2:
-            best_k = 3
-    diag["best_k"] = best_k
+    max_dev = float(np.max(np.abs(kya - gline)))
+    if verbose:
+        log.info(
+            "Dense warp: %d knots, max deviation from line = %.0f ms",
+            len(kxa), max_dev,
+        )
+    if max_dev < _WARP_MIN_DEVIATION_MS:
+        return None
 
-    if best_k == 1:
-        return None, diag
+    # Build continuous interior segments between consecutive knots, and anchor
+    # the edges to the GLOBAL line (events before the first / after the last
+    # knot use scale*t+offset, never a runaway local slope).
+    segs: list[Segment] = [
+        Segment(start_ms=float("-inf"), end_ms=float(kxa[0]),
+                scale=global_scale, offset_ms=global_offset_ms),
+    ]
+    n = len(kxa)
+    for i in range(n - 1):
+        x0, y0, x1, y1 = kxa[i], kya[i], kxa[i + 1], kya[i + 1]
+        scale = float(np.clip((y1 - y0) / (x1 - x0), 0.5, 2.0))
+        offset = y0 - scale * x0
+        segs.append(Segment(start_ms=float(x0), end_ms=float(x1),
+                            scale=scale, offset_ms=offset))
+    segs.append(Segment(start_ms=float(kxa[-1]), end_ms=float("inf"),
+                        scale=global_scale, offset_ms=global_offset_ms))
 
-    chosen_segs = best2_segs if best_k == 2 else best3_segs
-    chosen_bps = [best2_bp] if best_k == 2 else best3_bps or []
+    return segs if len(segs) >= _WARP_MIN_SEGMENTS else None
 
-    # Safety: bound the time discontinuity at each breakpoint.  Edit cuts
-    # produce fractional-second jumps; bigger ones usually mean overfitting.
-    jumps_ms = []
-    for bp in chosen_bps:
-        prev_seg = None
-        next_seg = None
-        for s in chosen_segs:  # type: ignore[union-attr]
-            if s[1] == bp:
-                prev_seg = s
-            if s[0] == bp:
-                next_seg = s
-        if prev_seg is None or next_seg is None:
-            continue
-        pred_prev = prev_seg[2] * bp + prev_seg[3]
-        pred_next = next_seg[2] * bp + next_seg[3]
-        jumps_ms.append(abs(pred_next - pred_prev))
-    diag["jumps_ms"] = jumps_ms
-    if jumps_ms and max(jumps_ms) > _PIECEWISE_MAX_JUMP_MS:
-        diag["reason"] = "breakpoint jump exceeds safety cap"
-        return None, diag
 
-    return chosen_segs, diag
+# ── automatic warp-vs-linear selection ────────────────────────────────────────
+
+# The warp must beat the single line on held-out data by at least this margin
+# (median) AND not worsen the worst-case (p90) beyond a small tolerance.  These
+# guards stop the warp from being chosen when the residual is just irreducible
+# cross-language scatter — chasing that noise overfits and hurts the tail.
+_WARP_CV_MARGIN_MS: float = 30.0
+_WARP_CV_P90_TOL: float = 1.05
+
+
+def _eval_segments(segs: list["Segment"], t: float) -> float:
+    for s in segs:
+        if s.start_ms <= t < s.end_ms:
+            return s.scale * t + s.offset_ms
+    return segs[-1].scale * t + segs[-1].offset_ms
+
+
+def _select_warp_cv(
+    inliers: list[dict],
+    global_scale: float,
+    global_offset_ms: float,
+    *,
+    verbose: bool = False,
+) -> list["Segment"] | None:
+    """Return warp segments ONLY when hold-out cross-validation shows the warp
+    generalises better than a single line; otherwise None (keep linear).
+
+    Splits the anchor pairs into interleaved fit / hold-out halves, fits both a
+    line and a warp on the fit half, and compares their error on the hold-out
+    half (data neither model trained on).  This is the honest test: a warp that
+    merely traces matching noise looks good on its own anchors but loses here.
+    """
+    if len(inliers) < _WARP_MIN_ANCHORS * 2:
+        return None
+
+    pairs = sorted((a["unsync_ms"], a["ref_ms"]) for a in inliers)
+    uns = np.array([p[0] for p in pairs], dtype=np.float64)
+    refm = np.array([p[1] for p in pairs], dtype=np.float64)
+    fit = np.arange(len(pairs)) % 2 == 0
+    hold = ~fit
+    fx, fy = uns[fit], refm[fit]
+    hx, hy = uns[hold], refm[hold]
+    if len(fx) < _WARP_MIN_ANCHORS or len(hx) < 10:
+        return None
+
+    # Single line fitted on the fit half.
+    a = np.vstack([fx, np.ones_like(fx)]).T
+    sl, ic = np.linalg.lstsq(a, fy, rcond=None)[0]
+    lin = np.abs((sl * hx + ic) - hy)
+    lin_med, lin_p90 = float(np.median(lin)), float(np.percentile(lin, 90))
+
+    # Warp fitted on the fit half, scored on the hold-out half.
+    fit_anchors = [{"unsync_ms": x, "ref_ms": y, "score": 1.0} for x, y in zip(fx, fy)]
+    segs = _dense_warp_from_pairs(fit_anchors, float(sl), float(ic))
+    if segs is None:
+        if verbose:
+            log.info("Warp CV: warp gate found data effectively linear — keeping line.")
+        return None
+    w = np.abs(np.array([_eval_segments(segs, t) for t in hx]) - hy)
+    w_med, w_p90 = float(np.median(w)), float(np.percentile(w, 90))
+
+    if verbose:
+        log.info(
+            "Warp CV: line holdout med=%.0f p90=%.0f | warp holdout med=%.0f p90=%.0f",
+            lin_med, lin_p90, w_med, w_p90,
+        )
+
+    if w_med < lin_med - _WARP_CV_MARGIN_MS and w_p90 <= lin_p90 * _WARP_CV_P90_TOL:
+        # Warp wins — rebuild it on ALL inliers for the final model.
+        if verbose:
+            log.info("Warp CV: warp wins — applying dense warp.")
+        return _dense_warp_from_pairs(inliers, global_scale, global_offset_ms, verbose=verbose)
+
+    if verbose:
+        log.info("Warp CV: line wins — keeping single linear model.")
+    return None
+
+
+def _resolve_warp(
+    mode: str,
+    inliers: list[dict],
+    global_scale: float,
+    global_offset_ms: float,
+    *,
+    verbose: bool = False,
+) -> list["Segment"] | None:
+    """Dispatch warp selection: 'off' never warps, 'on' forces a warp when one
+    can be built, 'auto' (default) keeps a warp only if hold-out CV prefers it.
+    """
+    if mode == "off":
+        return None
+    if mode == "on":
+        return _dense_warp_from_pairs(inliers, global_scale, global_offset_ms, verbose=verbose)
+    return _select_warp_cv(inliers, global_scale, global_offset_ms, verbose=verbose)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -890,6 +1013,8 @@ def align(
     max_offset_s: float = 600.0,
     resolution_ms: int = RESOLUTION_MS,
     verbose: bool = False,
+    workers: int = 0,
+    warp: str = "auto",
 ) -> AlignResult:
     """Synchronise *unsync_events* against *ref_events*.
 
@@ -898,13 +1023,26 @@ def align(
     mode : 'auto' | 'offset' | 'linear'
     max_offset_s :
         Maximum expected timing difference. Increase for very large gaps.
+    workers :
+        Threads for the FFT correlation loops.  0 (default) = auto / all CPUs;
+        1 = single-threaded.  The cross-correlation FFTs release the GIL, so
+        threading scales near-linearly with core count.
+    warp : 'auto' | 'on' | 'off'
+        Dense piecewise-linear warp for non-linear drift.  'auto' (default)
+        builds a warp candidate and keeps it only if hold-out cross-validation
+        shows it beats a single line — so it self-selects per file, picking the
+        warp for genuine structural breaks (edit cuts) and the line for ordinary
+        cross-language scatter.  'on' forces a warp; 'off' disables it.
     """
     if not ref_events:
         raise ValueError("Reference subtitle has no events.")
     if not unsync_events:
         raise ValueError("Unsynchronised subtitle has no events.")
 
+    n_workers = _resolve_workers(workers)
     max_offset_ms = max_offset_s * 1000
+    if verbose:
+        log.info("Using %d worker thread(s) for FFT correlation", n_workers)
 
     # ── 1. Build fingerprints ────────────────────────────────────────────
     # Exclude the first 90 s and last 2 min of each subtitle from fingerprinting.
@@ -954,7 +1092,7 @@ def align(
         log.info("Coarse FFT offset estimate: %+.3f s", coarse_ms / 1000)
 
     # ── 3. Windowed anchor search (full ref search — no restriction) ──────
-    anchors = _find_anchors(ref_fp, uns_fp, resolution_ms)
+    anchors = _find_anchors(ref_fp, uns_fp, resolution_ms, workers=n_workers)
 
     if verbose:
         log.info("Found %d candidate anchor pairs", len(anchors))
@@ -1042,7 +1180,8 @@ def align(
 
         # Pass 1: full-range search — finds the right neighbourhood for each segment.
         seg_offsets = _segmented_binary_alignment(
-            ref_fp_bin, uns_fp_bin, resolution_ms, max_offset_ms
+            ref_fp_bin, uns_fp_bin, resolution_ms, max_offset_ms,
+            workers=n_workers,
         )
 
         if verbose:
@@ -1094,6 +1233,7 @@ def align(
                 ref_fp_bin, uns_fp_bin, resolution_ms, max_offset_ms,
                 seed_scale=seg_scale, seed_offset_ms=seg_off_ms,
                 refine_radius_ms=float(refine_radius_p2),
+                workers=n_workers,
             )
             if len(seg_offsets2) >= 2:
                 seg_scale2, seg_off_ms2, seg_conf2, seg_n_in2 = _fit_segment_offsets(seg_offsets2)
@@ -1140,36 +1280,21 @@ def align(
                     seg_scale, seg_off_ms, seg_conf, seg_n_in = r_scale, r_off, r_conf, len(r_inliers)
                     seg_n_total = n_matched
 
-                    # Piecewise-linear check on the high-quality event-pair
-                    # inliers.  These are point matches (hundreds of them) so
-                    # they are the best signal we ever get for detecting
-                    # structural breaks (edit cuts, frame drops, VFR).
-                    pw_segs, pw_diag = _piecewise_linear_fit(r_inliers, verbose=verbose)
-                    if verbose:
-                        log.info(
-                            "Piecewise-linear search: BIC %s, best_k=%s",
-                            pw_diag.get("bic"), pw_diag.get("best_k"),
-                        )
-                        if pw_diag.get("reason"):
-                            log.info("  rejected: %s", pw_diag["reason"])
-                    if pw_segs:
-                        seg_segments = [
-                            Segment(start_ms=s, end_ms=e, scale=sc, offset_ms=of)
-                            for (s, e, sc, of) in pw_segs
-                        ]
-                        if verbose:
-                            for i, seg in enumerate(seg_segments):
-                                lo_s = "-inf" if seg.start_ms == float("-inf") else f"{seg.start_ms/1000:.1f}s"
-                                hi_s = "+inf" if seg.end_ms == float("inf") else f"{seg.end_ms/1000:.1f}s"
-                                log.info(
-                                    "  segment %d: [%s, %s)  scale=%.6f  offset=%+.3fs",
-                                    i + 1, lo_s, hi_s, seg.scale, seg.offset_ms / 1000,
-                                )
+                    # Dense piecewise-linear warp on the high-quality event-pair
+                    # inliers.  These are point matches (hundreds of them), so
+                    # they let us follow a non-linear drift (hand-timed subs,
+                    # accumulated micro-edits) that a single slope — or a coarse
+                    # 1-3 segment fit — would average into a mid-film delay.
+                    seg_segments = _resolve_warp(
+                        warp, r_inliers, seg_scale, seg_off_ms, verbose=verbose,
+                    )
+                    if seg_segments and verbose:
+                        log.info("Dense warp: %d continuous segments", len(seg_segments))
 
             if seg_conf > conf or len(inliers) < _MIN_INLIERS:
                 seg_mode = "linear" if abs(seg_scale - 1.0) > 1e-4 else "offset"
                 if seg_segments and len(seg_segments) > 1:
-                    seg_mode = "piecewise"
+                    seg_mode = "warp"
                 return AlignResult(
                     offset_ms=float(seg_off_ms),
                     scale=float(seg_scale),
@@ -1181,35 +1306,18 @@ def align(
                     segments=seg_segments,
                 )
 
-    # ── 6. Piecewise check on the main-path linear inliers ──────────────────
-    # For tests that never enter the segmented fallback (Tests 1-3) we still
-    # want to detect structural breaks.  The main windowed anchors are coarser
-    # than event-pair anchors, so this check is conservative — it only fires
-    # with plenty of inliers and a strong BIC win.
+    # ── 6. Dense-warp check on the main-path linear inliers ─────────────────
+    # For files that never enter the segmented fallback (Tests 1-3) we still
+    # want to follow a non-linear drift if one exists.  The deviation gate
+    # inside _dense_warp_from_pairs keeps truly-linear data on a single line,
+    # so well-behaved episodes are unaffected.
     final_segments: list[Segment] | None = None
-    if mode_used == "linear" and len(inliers) >= _PIECEWISE_MIN_ANCHORS_PER_SEG * 2:
-        pw_segs, pw_diag = _piecewise_linear_fit(inliers, verbose=verbose)
-        if verbose:
-            log.info(
-                "Piecewise-linear search (main path): BIC %s, best_k=%s",
-                pw_diag.get("bic"), pw_diag.get("best_k"),
-            )
-            if pw_diag.get("reason"):
-                log.info("  rejected: %s", pw_diag["reason"])
-        if pw_segs:
-            final_segments = [
-                Segment(start_ms=s, end_ms=e, scale=sc, offset_ms=of)
-                for (s, e, sc, of) in pw_segs
-            ]
-            mode_used = "piecewise"
+    if warp != "off" and mode_used == "linear" and len(inliers) >= _WARP_MIN_ANCHORS:
+        final_segments = _resolve_warp(warp, inliers, scale, offset_ms, verbose=verbose)
+        if final_segments:
+            mode_used = "warp"
             if verbose:
-                for i, seg in enumerate(final_segments):
-                    lo_s = "-inf" if seg.start_ms == float("-inf") else f"{seg.start_ms/1000:.1f}s"
-                    hi_s = "+inf" if seg.end_ms == float("inf") else f"{seg.end_ms/1000:.1f}s"
-                    log.info(
-                        "  segment %d: [%s, %s)  scale=%.6f  offset=%+.3fs",
-                        i + 1, lo_s, hi_s, seg.scale, seg.offset_ms / 1000,
-                    )
+                log.info("Dense warp (main path): %d continuous segments", len(final_segments))
 
     return AlignResult(
         offset_ms=float(offset_ms),
